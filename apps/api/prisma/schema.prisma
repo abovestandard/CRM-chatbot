@@ -1,0 +1,265 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// NOTE: pgvector is not yet installed on the target Postgres instance.
+// Once it is (`CREATE EXTENSION vector`), re-add `extensions = [vector]`
+// here, `previewFeatures = ["postgresqlExtensions"]` on the generator above,
+// and the `embedding` column on KnowledgeChunk below, then run a new
+// migration. Nothing else in Phase 1 depends on it.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  WEBSITE_ADMIN
+}
+
+enum WebsitePlatform {
+  WORDPRESS
+  LARAVEL
+  PHP
+  REACT
+  NODE
+  NEXTJS
+  SHOPIFY
+  CUSTOM
+  OTHER
+}
+
+enum WebsiteStatus {
+  DRAFT
+  TESTING
+  LIVE
+}
+
+enum AiProvider {
+  OPENAI
+  GEMINI
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  INDEXED
+  FAILED
+}
+
+enum UrlStatus {
+  PENDING
+  PROCESSING
+  INDEXED
+  FAILED
+}
+
+enum KnowledgeSourceType {
+  DOCUMENT
+  URL
+  WEBSITE_CONTENT
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+enum WidgetLauncherStyle {
+  BUBBLE
+  FULLSCREEN
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         UserRole
+  createdAt    DateTime @default(now())
+
+  createdWebsites Website[]      @relation("WebsiteCreatedBy")
+  websiteLinks    WebsiteUser[]
+  uploadedDocs    Document[]     @relation("DocumentUploadedBy")
+  addedUrls       UrlSource[]    @relation("UrlCreatedBy")
+
+  @@map("users")
+}
+
+model Website {
+  id        String          @id @default(uuid())
+  name      String
+  domain    String
+  platform  WebsitePlatform
+  status    WebsiteStatus   @default(DRAFT)
+  apiKey    String          @unique @default(uuid())
+  createdBy String
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  creator         User               @relation("WebsiteCreatedBy", fields: [createdBy], references: [id])
+  admins          WebsiteUser[]
+  aiProviderConfig AiProviderConfig?
+  widgetSettings  WidgetSettings?
+  documents       Document[]
+  urls            UrlSource[]
+  knowledgeChunks KnowledgeChunk[]
+  chatSessions    ChatSession[]
+  usageEvents     UsageEvent[]
+
+  @@map("websites")
+}
+
+// Explicit website <-> admin membership so access-scoping is a simple join
+// lookup rather than an implicit convention. A Super Admin bypasses this
+// table entirely (see requireWebsiteAccess middleware).
+model WebsiteUser {
+  id        String   @id @default(uuid())
+  websiteId String
+  userId    String
+  role      UserRole @default(WEBSITE_ADMIN)
+  createdAt DateTime @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, userId])
+  @@map("website_users")
+}
+
+model AiProviderConfig {
+  id                    String     @id @default(uuid())
+  websiteId             String     @unique
+  provider              AiProvider @default(OPENAI)
+  modelName             String     @default("gpt-4o-mini")
+  apiKeyEncrypted       String?
+  allowGeneralKnowledge Boolean    @default(false)
+  isActive              Boolean    @default(false)
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@map("ai_provider_configs")
+}
+
+// Visual/behavioral customization for the embeddable widget, fetched at
+// runtime by the public widget.js script via the website's apiKey — nothing
+// here is sensitive, unlike AiProviderConfig's key.
+model WidgetSettings {
+  id               String              @id @default(uuid())
+  websiteId        String              @unique
+  launcherStyle    WidgetLauncherStyle @default(BUBBLE)
+  greetingText     String              @default("How can we help you today?")
+  inputPlaceholder String              @default("Ask a question...")
+  brandColor       String              @default("#3457d5")
+  logoUrl          String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@map("widget_settings")
+}
+
+model Document {
+  id          String         @id @default(uuid())
+  websiteId   String
+  filename    String
+  fileType    String
+  storagePath String
+  status      DocumentStatus @default(PENDING)
+  uploadedBy  String
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  website  Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  uploader User    @relation("DocumentUploadedBy", fields: [uploadedBy], references: [id])
+
+  @@index([websiteId])
+  @@map("documents")
+}
+
+model UrlSource {
+  id            String    @id @default(uuid())
+  websiteId     String
+  url           String
+  status        UrlStatus @default(PENDING)
+  lastCrawledAt DateTime?
+  createdBy     String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  creator User    @relation("UrlCreatedBy", fields: [createdBy], references: [id])
+
+  @@index([websiteId])
+  @@map("url_sources")
+}
+
+// Unified retrieval table for the RAG search. Every row is scoped by
+// websiteId so a similarity query can never cross tenant boundaries.
+// Embeddings are stored as plain JSON float arrays and compared with
+// in-process cosine similarity (see lib/embeddings) rather than a pgvector
+// column — this avoids depending on the pgvector extension (not installed
+// on the target Postgres, see NOTE at top of file) while still giving real
+// semantic search. embeddingProvider/embeddingModel let retrieval only
+// compare vectors produced by the same model (different models' vector
+// spaces aren't comparable); chunks without a usable embedding (no AI
+// provider configured yet at indexing time, or an embedding call failed)
+// fall back to keyword search instead.
+model KnowledgeChunk {
+  id               String              @id @default(uuid())
+  websiteId        String
+  sourceType       KnowledgeSourceType
+  sourceId         String
+  content          String
+  embedding        Json?
+  embeddingProvider String?
+  embeddingModel   String?
+  createdAt        DateTime            @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@index([websiteId, embeddingProvider, embeddingModel])
+  @@map("knowledge_chunks")
+}
+
+model ChatSession {
+  id        String   @id @default(uuid())
+  websiteId String
+  visitorId String
+  createdAt DateTime @default(now())
+
+  website  Website       @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@index([websiteId])
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  sessionId String
+  role      ChatRole
+  content   String
+  createdAt DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("chat_messages")
+}
+
+model UsageEvent {
+  id        String   @id @default(uuid())
+  websiteId String
+  eventType String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@map("usage_events")
+}

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: crm-chatbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm_dev_password
+      POSTGRES_DB: crm_chatbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - crm_chatbot_pgdata:/var/lib/postgresql/data
+
+volumes:
+  crm_chatbot_pgdata:
